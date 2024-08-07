@@ -9,7 +9,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
-type ReadTransmitter = Arc<Mutex<Sender<Result<Vec<u8>, StreamError>>>>;
+type ReadTransmitter = Arc<Mutex<Sender<Result<Frame, StreamError>>>>;
 pub enum StreamKind {
     Client,
     Server,
@@ -75,7 +75,12 @@ impl<R: AsyncReadExt + Unpin> ReadStream<R> {
                                     self.read_tx
                                         .lock()
                                         .await
-                                        .send(Ok(fragmented_message_clone))
+                                        // TODO - Check if we need to send Continue or Text or Binary
+                                        .send(Ok(Frame::new(
+                                            true,
+                                            OpCode::Text,
+                                            fragmented_message_clone,
+                                        )))
                                         .await
                                         .map_err(|_| StreamError::CommunicationError)?;
 
@@ -87,10 +92,16 @@ impl<R: AsyncReadExt + Unpin> ReadStream<R> {
                             }
                         }
                         OpCode::Text | OpCode::Binary => {
+                            // If we have a fragmented message in progress, and we receive a Text or Binary
+                            // with FIN bit as 1(final), before receiving a Continue Opcode with FIN bit 1(Last fragment)
+                            // we should disconnect
+                            if self.fragmented_message.is_some() {
+                                Err(StreamError::InvalidFrameFragmentation)?
+                            }
                             self.read_tx
                                 .lock()
                                 .await
-                                .send(Ok(frame.payload))
+                                .send(Ok(frame))
                                 .await
                                 .map_err(|_| StreamError::CommunicationError)?;
                         }
@@ -139,6 +150,18 @@ impl<R: AsyncReadExt + Unpin> ReadStream<R> {
         // to get the last 4 bits of the first byte
         let opcode = OpCode::from(header[0] & 0b00001111)?;
 
+        // RSV is a short for "Reserved" fields, they are optional flags that aren't used by the
+        // base websockets protocol, only if there is an extension of the protocol in use.
+        // If these bits are received as non-zero in the absence of any defined extension, the connection
+        // needs to fail, immediately
+        let rsv1 = (header[0] & 0b01000000) != 0;
+        let rsv2 = (header[0] & 0b00100000) != 0;
+        let rsv3 = (header[0] & 0b00010000) != 0;
+
+        if rsv1 || rsv2 || rsv3 {
+            return Err(Error::new(ErrorKind::InvalidData, "RSV not zero"));
+        }
+
         // As a rule in websockets protocol, if your opcode is a control opcode(ping,pong,close), your message can't be fragmented(split between multiple frames)
         if !final_fragment && opcode.is_control() {
             Err(Error::new(
@@ -155,6 +178,14 @@ impl<R: AsyncReadExt + Unpin> ReadStream<R> {
         // Mask bit - which we discussed before - and the next 7 bits are used to represent the
         // payload length, or the size of the data being sent in the frame.
         let mut length = (header[1] & 0b01111111) as usize;
+
+        // Control frames are only allowed to have a payload up to and including 125 octets
+        if length > 125 && opcode.is_control() {
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Control frame with invalid payload size, can be greater than 125",
+            ))?;
+        }
 
         if length == 126 {
             let mut be_bytes = [0u8; 2];
